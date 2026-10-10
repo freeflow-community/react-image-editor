@@ -6,6 +6,7 @@ import {
   aspectOption,
   openImageEditorDialog,
   type AspEditorError,
+  type AspEditorHandle,
   type AspExportFormat,
   type AspExportTarget,
   type AspMode,
@@ -20,29 +21,29 @@ const ALL_FORMATS: readonly AspExportFormat[] = ['png', 'jpeg', 'webp', 'svg', '
  * pixels stays high-contrast while an upscaled one visibly blurs — which is
  * what {@link measureSharpness} measures.
  */
-function gridImageDataUrl(size: number): string {
+function gridImageDataUrl(size: number, height = size): string {
   const canvas = document.createElement('canvas');
   canvas.width = size;
-  canvas.height = size;
+  canvas.height = height;
   const ctx = canvas.getContext('2d');
   if (!ctx) {
     throw new Error('2d context unavailable');
   }
   ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, size, size);
+  ctx.fillRect(0, 0, size, height);
   ctx.fillStyle = '#000000';
   const step = Math.max(4, Math.round(size / 24));
   for (let x = 0; x < size; x += step) {
-    ctx.fillRect(x, 0, 1, size);
+    ctx.fillRect(x, 0, 1, height);
   }
-  for (let y = 0; y < size; y += step) {
+  for (let y = 0; y < height; y += step) {
     ctx.fillRect(0, y, size, 1);
   }
   ctx.strokeStyle = '#000000';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(0, 0);
-  ctx.lineTo(size, size);
+  ctx.lineTo(size, height);
   ctx.stroke();
   return canvas.toDataURL('image/png');
 }
@@ -128,11 +129,22 @@ export default function E2eHarness(): ReactElement {
   );
   // `source=2400` generates a 2400x2400 grid image; without it the demo's own
   // sample auto-loads, which is what the pre-existing suite expects.
-  const sourceSize = Number(params.get('source'));
-  const src = useMemo(
-    () => (Number.isFinite(sourceSize) && sourceSize > 0 ? gridImageDataUrl(sourceSize) : null),
-    [sourceSize],
-  );
+  // `source=1600x1200` generates a grid image that is not square.
+  const sourceParam = params.get('source') ?? '';
+  const src = useMemo(() => {
+    const box = parseTarget(sourceParam);
+    if (box) {
+      return gridImageDataUrl(box.width, box.height);
+    }
+    const size = Number(sourceParam);
+    return Number.isFinite(size) && size > 0 ? gridImageDataUrl(size) : null;
+  }, [sourceParam]);
+  // `bounds=image` exports the picture itself rather than the editing surface,
+  // and the engine handle is published for the programmatic-API tests.
+  const exportBounds = params.get('bounds') === 'image' ? 'image' : 'canvas';
+  const onReady = useCallback((handle: AspEditorHandle) => {
+    (window as unknown as { __aspHandle?: AspEditorHandle }).__aspHandle = handle;
+  }, []);
   // `format=jpeg` puts that format first, which is what basic-mode Save uses.
   const formatParam = params.get('format') as AspExportFormat | null;
   const exportFormats = useMemo<readonly AspExportFormat[]>(
@@ -208,6 +220,8 @@ export default function E2eHarness(): ReactElement {
           initialAspect={initialAspect}
           aspectRatios={aspectRatios}
           exportTarget={exportTarget}
+          exportBounds={exportBounds}
+          onReady={onReady}
           exportFormats={exportFormats}
           onSaved={onSaved}
           onExported={onExported}

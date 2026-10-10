@@ -24,6 +24,14 @@ import { buildFabricFilters, LOOK_FILTERS } from './fabric-filters';
 import { loadFabric, type FabricModule } from './fabric-loader';
 import { resolveExport } from './export-config';
 import { exportMultiplier, exportPixelSize } from './export-scale';
+import {
+  outputSizeOf,
+  toSceneLength,
+  toScenePoint,
+  toSceneRect,
+  type OutputRect,
+  type OutputSpace,
+} from './output-space';
 import { DeltaHistory, type HistoryStep } from './delta-history';
 import { FILTER_REGISTRY } from '../registry/tool-registry';
 import {
@@ -48,6 +56,17 @@ export interface EngineOptions {
    * HEIC/HEIF file throws a descriptive error.
    */
   readonly heicDecoderLoader?: AspHeicDecoderLoader | null;
+  /**
+   * What an export holds when no crop or artboard is set. `'canvas'` (the
+   * default) is the editing surface as drawn, at its on-screen size. `'image'`
+   * is the picture itself — its bounds, at the source's real resolution — which
+   * is what a host that saves the edit back over the original wants.
+   */
+  readonly exportBounds?: 'canvas' | 'image';
+  /** Longest side an imported picture keeps, in pixels (larger ones are downscaled). Default 4096. */
+  readonly maxImportDim?: number;
+  /** Largest bitmap area an export may allocate, in pixels. Default 4096². */
+  readonly maxExportPixels?: number;
 }
 
 export type ShapeKind =
@@ -287,6 +306,15 @@ export class EditorEngine {
   /** Consumer-injected loaders for the optional heavy features (may be null). */
   private readonly bgRemovalLoader: AspBackgroundRemovalLoader | null;
   private readonly heicLoader: AspHeicDecoderLoader | null;
+  private readonly exportBounds: 'canvas' | 'image';
+  private readonly maxImportDim: number;
+  private readonly maxExportPixels: number | undefined;
+  /** Width the export is scaled down to, when the host asked for one (see {@link setOutputWidth}). */
+  private outputWidth: number | null = null;
+  /** Open {@link batch} calls; commits are held back while this is above zero. */
+  private batchDepth = 0;
+  /** The label of the last commit held back by a batch, if any. */
+  private batchPending: string | null = null;
 
   /** Snap distance in *screen* pixels; divided by zoom to get a scene threshold. */
   private static readonly SNAP_PX = 7;
@@ -298,6 +326,10 @@ export class EditorEngine {
     this.canvas = canvas;
     this.bgRemovalLoader = options.backgroundRemovalLoader ?? null;
     this.heicLoader = options.heicDecoderLoader ?? null;
+    this.exportBounds = options.exportBounds ?? 'canvas';
+    this.maxImportDim =
+      options.maxImportDim && options.maxImportDim > 0 ? options.maxImportDim : MAX_IMPORT_DIM;
+    this.maxExportPixels = options.maxExportPixels;
     this.history = new DeltaHistory('Opened editor', this.snapshot());
     const notify = (): void => {
       this.notifySelection();
@@ -1350,7 +1382,7 @@ export class EditorEngine {
 
   /** Render the output region to a data URL at its target pixel size. */
   private artboardDataUrl(format: 'png' | 'jpeg' | 'webp', quality: number): string {
-    const rect = this.outputRect();
+    const rect = this.exportRect();
     if (!rect) {
       return this.canvas.toDataURL({ format, quality, multiplier: 1 });
     }
@@ -1358,7 +1390,10 @@ export class EditorEngine {
     // would pin the result to the host's canvas width and throw the photo's real
     // pixels away. A centered artboard targets its preset width; a crop region
     // recovers the source pixels beneath it, optionally capped by exportTarget.
-    const multiplier = this.exportMultiplierFor(rect);
+    // Fabric floors the bitmap size, so a region that works out a hair under a
+    // whole pixel (1599.9999) would lose one. Aim just past the rounded size.
+    const size = exportPixelSize(rect, this.exportMultiplierFor(rect));
+    const multiplier = Math.max(size.width / rect.width, size.height / rect.height) * (1 + 1e-6);
     return this.atIdentityViewport(() =>
       this.canvas.toDataURL({
         format,
@@ -1374,15 +1409,39 @@ export class EditorEngine {
 
   /** The render multiplier for the current output region. */
   private exportMultiplierFor(rect: FrameRect): number {
-    if (!this.cropRegion) {
+    if (!this.cropRegion && (this.artboard || this.exportBounds !== 'image')) {
       return this.artboard ? this.artboard.width / rect.width : 1;
     }
+    // A width asked for through setOutputWidth wins over the host's exportTarget,
+    // which only speaks for crops.
+    const target = this.outputWidth
+      ? { width: this.outputWidth }
+      : this.cropRegion
+        ? this.exportTarget
+        : null;
     return exportMultiplier({
       regionWidth: rect.width,
       regionHeight: rect.height,
       sourcePerScene: this.sourcePerScene(),
-      target: this.exportTarget,
+      target,
+      maxPixels: this.maxExportPixels,
     });
+  }
+
+  /**
+   * The scene rectangle an export holds: the committed crop, else the centered
+   * artboard, else (with `exportBounds: 'image'`) the picture's own bounds. Null
+   * means the whole canvas. Unlike {@link outputRect} this never drives the dim
+   * mask — an uncropped picture is not drawn as if it were cropped.
+   */
+  private exportRect(): FrameRect | null {
+    const rect = this.outputRect();
+    if (rect || this.exportBounds !== 'image' || !this.baseImage) {
+      return rect;
+    }
+    this.baseImage.setCoords();
+    const box = this.baseImage.getBoundingRect();
+    return { left: box.left, top: box.top, width: box.width, height: box.height };
   }
 
   /** Source image pixels packed into each scene unit (1 when there is no image). */
@@ -1413,7 +1472,11 @@ export class EditorEngine {
     if (this.cropRegion) {
       return exportPixelSize(this.cropRegion, this.exportMultiplierFor(this.cropRegion));
     }
-    return this.artboard;
+    if (this.artboard) {
+      return this.artboard;
+    }
+    const rect = this.exportRect();
+    return rect ? exportPixelSize(rect, this.exportMultiplierFor(rect)) : null;
   }
 
   /**
@@ -1551,14 +1614,14 @@ export class EditorEngine {
   private async resolveImportUrl(src: string | Blob): Promise<string> {
     const svgText = await svgTextFrom(src);
     if (svgText) {
-      return rasterizeSvg(svgText, MAX_IMPORT_DIM);
+      return rasterizeSvg(svgText, this.maxImportDim);
     }
     if (typeof src === 'string') {
       return src.startsWith('data:')
-        ? decodeImageBlob(dataUrlToBlob(src), MAX_IMPORT_DIM, '', this.heicLoader)
+        ? decodeImageBlob(dataUrlToBlob(src), this.maxImportDim, '', this.heicLoader)
         : src;
     }
-    return decodeImageBlob(src, MAX_IMPORT_DIM, (src as File).name ?? '', this.heicLoader);
+    return decodeImageBlob(src, this.maxImportDim, (src as File).name ?? '', this.heicLoader);
   }
 
   /**
@@ -2705,6 +2768,10 @@ export class EditorEngine {
   }
 
   private commit(label: string): void {
+    if (this.batchDepth > 0) {
+      this.batchPending = label;
+      return;
+    }
     this.history.push(label, this.snapshot());
     this.notifyLayers();
   }
@@ -3015,6 +3082,255 @@ export class EditorEngine {
   getImageData(): ImageData | null {
     const ctx = this.canvas.getContext();
     return ctx ? ctx.getImageData(0, 0, this.canvas.getWidth(), this.canvas.getHeight()) : null;
+  }
+
+  // ---- programmatic editing (output-pixel coordinates) ---------------------
+  //
+  // For callers that cannot drag a frame or a shape: scripts, tests, an AI agent.
+  // Every coordinate here is a pixel of the picture as it would export right now
+  // (see `output-space.ts`), so a caller that was shown the export can point at
+  // what it saw, whatever size the editor happens to be drawn at.
+
+  /** The pixel size the picture would export at right now, or null with nothing to export. */
+  getOutputSize(): { width: number; height: number } | null {
+    const space = this.outputSpace();
+    return space ? outputSizeOf(space) : null;
+  }
+
+  private outputSpace(): OutputSpace | null {
+    const rect =
+      this.exportRect() ??
+      (this.baseImage
+        ? { left: 0, top: 0, width: this.canvas.getWidth(), height: this.canvas.getHeight() }
+        : null);
+    return rect ? { rect, multiplier: this.exportMultiplierFor(rect) } : null;
+  }
+
+  /**
+   * Run several edits as one history step: every commit made inside `fn` is held
+   * back and a single one, labeled `label`, is recorded when it finishes (also
+   * when it throws, so a half-applied batch can still be undone). Nested batches
+   * fold into the outermost.
+   */
+  async batch<T>(label: string, fn: () => T | Promise<T>): Promise<T> {
+    this.batchDepth += 1;
+    try {
+      return await fn();
+    } finally {
+      this.batchDepth -= 1;
+      if (this.batchDepth === 0 && this.batchPending !== null) {
+        this.batchPending = null;
+        this.commit(label);
+      }
+    }
+  }
+
+  /**
+   * Crop to a rectangle of the current picture. Like the interactive crop this
+   * sets the output region (the surroundings are dimmed, not deleted), so it can
+   * be widened again with {@link clearCropRegion}. Returns false when the
+   * rectangle lies outside the picture.
+   */
+  cropTo(rect: OutputRect): boolean {
+    const space = this.outputSpace();
+    const region = space && toSceneRect(space, rect);
+    if (!region) {
+      return false;
+    }
+    if (this.imageCropActive) {
+      this.endImageCrop();
+    }
+    if (this.cropFrame) {
+      this.endCropSession();
+    }
+    this.cropRegion = region;
+    this.artboard = null;
+    this.clearOverlay();
+    this.canvas.renderAll();
+    return true;
+  }
+
+  /**
+   * Scale the export down to `width` pixels (the height follows the picture's
+   * shape); null goes back to full resolution. Never scales up: a width beyond
+   * the source's real pixels is capped. Returns the resulting size.
+   */
+  setOutputWidth(width: number | null): { width: number; height: number } | null {
+    this.outputWidth = width !== null && Number.isFinite(width) && width >= 1 ? width : null;
+    return this.getOutputSize();
+  }
+
+  /**
+   * Add a shape at a place in the picture. Boxed shapes fill `box`; a `line` or
+   * `arrow` runs from `from` to `to` (the arrow points at `to`). Stroke width and
+   * corner radius are in output pixels. Returns the new layer's id, or null when
+   * the geometry does not fit the shape or lies outside the picture.
+   */
+  addShapeAt(
+    kind: ShapeKind,
+    style: AnnotationStyle & { readonly fill?: string },
+    geometry: {
+      readonly box?: OutputRect;
+      readonly from?: { readonly x: number; readonly y: number };
+      readonly to?: { readonly x: number; readonly y: number };
+    },
+  ): string | null {
+    const space = this.outputSpace();
+    if (!space) {
+      return null;
+    }
+    const strokeWidth = Math.max(0.5, toSceneLength(space, style.strokeWidth));
+    let object: Fabric.FabricObject;
+    if (kind === 'line' || kind === 'arrow') {
+      if (!geometry.from || !geometry.to) {
+        return null;
+      }
+      const a = toScenePoint(space, geometry.from.x, geometry.from.y);
+      const b = toScenePoint(space, geometry.to.x, geometry.to.y);
+      const length = Math.hypot(b.x - a.x, b.y - a.y);
+      if (!Number.isFinite(length) || length < 1) {
+        return null;
+      }
+      // Built along the x axis around the midpoint, then turned to face `to`.
+      const head = kind === 'arrow' ? Math.min(length, strokeWidth * 4 + 8) : 0;
+      const parts: Fabric.FabricObject[] = [
+        new this.fabric.Line([-length / 2, 0, length / 2 - head * 0.6, 0], {
+          stroke: style.color,
+          strokeWidth,
+        }),
+      ];
+      if (head > 0) {
+        parts.push(
+          new this.fabric.Triangle({
+            left: length / 2 - head / 2,
+            top: 0,
+            originX: 'center',
+            originY: 'center',
+            angle: 90,
+            width: head,
+            height: head,
+            fill: style.color,
+          }),
+        );
+      }
+      object = new this.fabric.Group(parts, {
+        left: (a.x + b.x) / 2,
+        top: (a.y + b.y) / 2,
+        originX: 'center',
+        originY: 'center',
+        angle: (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI,
+      });
+    } else {
+      const box = geometry.box && toSceneRect(space, geometry.box);
+      if (!box) {
+        return null;
+      }
+      // The stock shape, re-sized to the box. Its commit is folded into ours.
+      this.batchDepth += 1;
+      try {
+        this.addShape(kind, { ...style, strokeWidth, cornerRadius: 0 });
+      } finally {
+        this.batchDepth -= 1;
+        this.batchPending = null;
+      }
+      const made = this.canvas.getActiveObject();
+      if (!made) {
+        return null;
+      }
+      this.canvas.remove(made);
+      object = made;
+      const w = Math.max(1, box.width - strokeWidth);
+      const h = Math.max(1, box.height - strokeWidth);
+      if (kind === 'rect') {
+        const radius = clampCornerRadius(toSceneLength(space, style.cornerRadius ?? 0), w, h);
+        object.set({ width: w, height: h, rx: radius, ry: radius });
+      } else if (kind === 'ellipse') {
+        object.set({ rx: w / 2, ry: h / 2 });
+      } else {
+        object.set({ scaleX: w / (object.width || 1), scaleY: h / (object.height || 1) });
+      }
+      object.set({
+        left: box.left + box.width / 2,
+        top: box.top + box.height / 2,
+        originX: 'center',
+        originY: 'center',
+        strokeUniform: true,
+        fill: style.fill ?? 'transparent',
+      });
+    }
+    return this.placeObject(object, 'Add shape');
+  }
+
+  /**
+   * Add text at a place in the picture: its top-left corner at (`x`, `y`),
+   * wrapping at `width` when given (else at the picture's right edge). Font size
+   * is in output pixels. Returns the new layer's id, or null with no picture.
+   */
+  addTextBox(
+    text: string,
+    style: TextStyle & {
+      readonly bold?: boolean;
+      readonly italic?: boolean;
+      readonly align?: 'left' | 'center' | 'right';
+      readonly background?: string;
+    },
+    at: { readonly x: number; readonly y: number; readonly width?: number },
+  ): string | null {
+    const space = this.outputSpace();
+    if (!space || !text) {
+      return null;
+    }
+    const origin = toScenePoint(space, at.x, at.y);
+    const room = space.rect.left + space.rect.width - origin.x;
+    const width = at.width && at.width > 0 ? toSceneLength(space, at.width) : Math.max(20, room);
+    const textbox = new this.fabric.Textbox(text, {
+      left: origin.x,
+      top: origin.y,
+      originX: 'left',
+      originY: 'top',
+      width,
+      fontSize: Math.max(1, toSceneLength(space, style.fontSize)),
+      fill: style.color,
+      fontFamily: style.fontFamily ?? 'system-ui, sans-serif',
+      fontWeight: style.bold ? 'bold' : 'normal',
+      fontStyle: style.italic ? 'italic' : 'normal',
+      textAlign: style.align ?? 'left',
+      backgroundColor: style.background ?? '',
+    });
+    return this.placeObject(textbox, 'Add text');
+  }
+
+  /**
+   * Conceal a rectangle of the picture, as the Redact tool does once its marquee
+   * is placed. Returns false when the rectangle lies outside the picture.
+   */
+  async redactRect(rect: OutputRect, mode: RedactMode): Promise<boolean> {
+    const space = this.outputSpace();
+    const region = space && toSceneRect(space, rect);
+    if (!region) {
+      return false;
+    }
+    this.addRedactionMarqueeAt(region.left + region.width / 2, region.top + region.height / 2);
+    const marquee = this.findByRole('redact-marquee');
+    if (!marquee) {
+      return false;
+    }
+    marquee.set({ left: region.left, top: region.top, width: region.width, height: region.height, scaleX: 1, scaleY: 1 });
+    marquee.setCoords();
+    await this.applyRedaction(mode);
+    return true;
+  }
+
+  private placeObject(object: Fabric.FabricObject, label: string): string {
+    const id = this.nextId();
+    object.set('aspId', id);
+    this.canvas.add(object);
+    object.setCoords();
+    this.canvas.discardActiveObject();
+    this.canvas.requestRenderAll();
+    this.commit(label);
+    this.notifySelection();
+    return id;
   }
 
   // ---- lifecycle -----------------------------------------------------------

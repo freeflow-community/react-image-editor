@@ -27,6 +27,7 @@ import type {
 } from '../types/editor.types';
 import { DEFAULT_FONTS, GOOGLE_FONTS, type FontOption } from '../fonts/fonts';
 import { useEditorController, type EditorBinding } from '../controller/use-editor-controller';
+import type { AspEditorHandle } from '../controller/editor-controller';
 import { AspHistoryList } from './HistoryList';
 import { AspLayerList } from './LayerList';
 import { AspOptionsPanel, FRAME_OPTIONS } from './OptionsPanel';
@@ -99,6 +100,17 @@ export interface ImageEditorProps {
    * option carrying `width`/`height` overrides this while it is selected.
    */
   readonly exportTarget?: AspExportTarget | null;
+  /**
+   * What an export holds when nothing is cropped: `'canvas'` (default) is the
+   * editing surface at its on-screen size; `'image'` is the picture itself at
+   * its real resolution. Use `'image'` when a save replaces the original.
+   * Read once, when the editor mounts.
+   */
+  readonly exportBounds?: 'canvas' | 'image';
+  /** Longest side an imported picture keeps, in pixels (default 4096). Read once. */
+  readonly maxImportDim?: number;
+  /** Largest bitmap area an export may allocate, in pixels (default 4096²). Read once. */
+  readonly maxExportPixels?: number;
   readonly baseColor?: string;
   readonly accentColor?: string;
   readonly themeMode?: AspThemeMode;
@@ -132,6 +144,11 @@ export interface ImageEditorProps {
   readonly onExported?: (blob: Blob) => void;
   /** Fired on a recoverable error (load/export/engine init) instead of throwing. */
   readonly onError?: (error: AspEditorError) => void;
+  /**
+   * Fired with a handle on the engine each time an image has loaded, for hosts
+   * that drive the editor from code. See {@link AspEditorHandle}.
+   */
+  readonly onReady?: (handle: AspEditorHandle) => void;
 }
 
 /**
@@ -156,6 +173,9 @@ export function ImageEditor({
   exportFormats = ['png', 'jpeg', 'webp'],
   exportQuality = 90,
   exportTarget = null,
+  exportBounds = 'canvas',
+  maxImportDim,
+  maxExportPixels,
   baseColor = FALLBACK_BASE,
   accentColor = FALLBACK_ACCENT,
   themeMode = 'light',
@@ -170,6 +190,7 @@ export function ImageEditor({
   onImageLoaded,
   onExported,
   onError,
+  onReady,
 }: ImageEditorProps): ReactElement {
   const hostRef = useRef<HTMLDivElement>(null);
 
@@ -184,6 +205,10 @@ export function ImageEditor({
     exportFormats,
     exportQuality,
     exportTarget,
+    exportBounds,
+    maxImportDim,
+    maxExportPixels,
+    onReady,
     keyboardEnabled,
     fonts,
     backgroundRemovalLoader,
