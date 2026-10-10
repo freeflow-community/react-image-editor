@@ -129,11 +129,30 @@ export interface EditorControllerProps {
   readonly fonts: readonly FontOption[];
   readonly backgroundRemovalLoader: AspBackgroundRemovalLoader | null;
   readonly heicDecoderLoader: AspHeicDecoderLoader | null;
+  /** Engine export options, read once when the engine is created. */
+  readonly exportBounds?: 'canvas' | 'image';
+  readonly maxImportDim?: number;
+  readonly maxExportPixels?: number;
+  /** Fired with a handle on the engine each time an image has loaded into it. */
+  readonly onReady?: (handle: AspEditorHandle) => void;
   readonly onSaved?: (blob: Blob) => void;
   readonly onCanceled?: () => void;
   readonly onImageLoaded?: () => void;
   readonly onExported?: (blob: Blob) => void;
   readonly onError?: (error: AspEditorError) => void;
+}
+
+/**
+ * A host's handle on a mounted editor, for driving it from code (an AI agent, a
+ * script) while the user watches. Call the engine directly, then `refresh()` so
+ * the panels, history and layer list show what changed.
+ */
+export interface AspEditorHandle {
+  readonly engine: EditorEngine;
+  /** Re-read the engine's state into the UI. */
+  refresh(): void;
+  /** The current picture as the Save button would deliver it, without firing `onSaved`. */
+  exportBlob(): Promise<Blob>;
 }
 
 function defaultAdjustmentValues(): Record<string, number> {
@@ -356,6 +375,9 @@ export class EditorController {
           height,
           backgroundRemovalLoader: this.props.backgroundRemovalLoader,
           heicDecoderLoader: this.props.heicDecoderLoader,
+          exportBounds: this.props.exportBounds,
+          maxImportDim: this.props.maxImportDim,
+          maxExportPixels: this.props.maxExportPixels,
         });
         this.engine.setSelectionListener((info) => this.onSelectionChange(info));
         // Full sync (not just layers): the engine notifies here after commits
@@ -422,9 +444,35 @@ export class EditorController {
       this.sync();
       this.applyInitialAspect();
       this.props.onImageLoaded?.();
+      const handle = this.handle();
+      if (handle) {
+        this.props.onReady?.(handle);
+      }
     } catch (error) {
       this.emitError('load-failed', error);
     }
+  }
+
+  /** The host's handle on the engine (see {@link AspEditorHandle}), once there is one. */
+  handle(): AspEditorHandle | null {
+    const engine = this.engine;
+    if (!engine) {
+      return null;
+    }
+    return {
+      engine,
+      refresh: () => {
+        this.sync();
+        this.syncUiFromEngine();
+        this.patch({ hasCropRegion: engine.hasCropRegion(), cropActive: engine.isCropping() });
+      },
+      exportBlob: () =>
+        engine.exportImage(
+          this.props.exportFormats[0] ?? 'png',
+          this.state.exportQ,
+          this.props.exportFormats,
+        ),
+    };
   }
 
   /**

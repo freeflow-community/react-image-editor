@@ -59,6 +59,8 @@ export {
   type Viewport,
   type AiProgress,
 } from './engine/editor-engine';
+export type { OutputRect } from './engine/output-space';
+export type { AspEditorHandle } from './controller/editor-controller';
 export { EditHistory, type HistoryEntry } from './engine/history';
 export { DeltaHistory, type HistoryStep } from './engine/delta-history';
 
