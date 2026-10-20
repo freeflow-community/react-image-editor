@@ -15,6 +15,7 @@ interface Handle {
     rotateBy(deg: number): void;
     addShapeAt(kind: string, style: object, geometry: object): string | null;
     addTextBox(text: string, style: object, at: object): string | null;
+    addImageAt(src: string | Blob, at: object, opts?: object): Promise<string | null>;
     redactRect(rect: object, mode: string): Promise<boolean>;
     batch<T>(label: string, fn: () => T | Promise<T>): Promise<T>;
     getLayers(): unknown[];
@@ -179,6 +180,36 @@ test.describe('programmatic editing', () => {
     ]);
     expect(out.colors[0]).toBe('0,0,255');
     expect(out.colors[1]).not.toBe('0,0,255');
+  });
+
+  test('addImageAt puts a picture over the picture as a layer, where and as big as asked', async ({ page }) => {
+    await open(page);
+    const result = await page.evaluate(async () => {
+      const { engine } = (window as Win).__aspHandle!;
+      // A 40x20 solid magenta picture, drawn 400 pixels wide (so 200 high) at (100, 100).
+      const canvas = document.createElement('canvas');
+      canvas.width = 40;
+      canvas.height = 20;
+      const ctx = canvas.getContext('2d')!;
+      ctx.fillStyle = '#ff00ff';
+      ctx.fillRect(0, 0, 40, 20);
+      const before = engine.getLayers().length;
+      const id = await engine.addImageAt(canvas.toDataURL('image/png'), { x: 100, y: 100, width: 400 });
+      return { id, added: engine.getLayers().length - before };
+    });
+    expect(result.id).toBeTruthy();
+    expect(result.added).toBe(1);
+    const out = await exported(page, [
+      [110, 110],
+      [490, 290],
+      [510, 200],
+      [300, 310],
+    ]);
+    expect(out.width).toBe(1600);
+    expect(out.colors[0]).toBe('255,0,255');
+    expect(out.colors[1]).toBe('255,0,255');
+    expect(out.colors[2]).not.toBe('255,0,255');
+    expect(out.colors[3]).not.toBe('255,0,255');
   });
 
   test('redactRect conceals a rectangle', async ({ page }) => {

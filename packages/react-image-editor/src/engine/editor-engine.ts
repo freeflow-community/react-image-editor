@@ -3262,6 +3262,48 @@ export class EditorEngine {
   }
 
   /**
+   * Put a picture over the picture as a layer of its own (a logo, a signature, a
+   * pasted screenshot), which stays movable and resizable: its top-left corner at
+   * (`x`, `y`), `width` wide (the height keeps its shape, unless `height` is given
+   * too) or at its own size. Positions and sizes are output pixels. `opacity` is
+   * 0–1. Returns the new layer's id, or null with no picture or a size under 1.
+   */
+  async addImageAt(
+    src: string | Blob,
+    at: { readonly x: number; readonly y: number; readonly width?: number; readonly height?: number },
+    opts: { readonly opacity?: number } = {},
+  ): Promise<string | null> {
+    const space = this.outputSpace();
+    if (!space) {
+      return null;
+    }
+    const url = await this.resolveImportUrl(src);
+    const loadOptions = url.startsWith('data:') ? {} : { crossOrigin: 'anonymous' as const };
+    const image = await this.fabric.FabricImage.fromURL(url, loadOptions, {});
+    const iw = image.width || 0;
+    const ih = image.height || 0;
+    if (!iw || !ih) {
+      throw new Error('The image could not be loaded.');
+    }
+    const w = at.width && at.width > 0 ? at.width : at.height && at.height > 0 ? (at.height * iw) / ih : iw;
+    const h = at.height && at.height > 0 ? at.height : (w * ih) / iw;
+    if (!(w >= 1 && h >= 1) || !Number.isFinite(w) || !Number.isFinite(h)) {
+      return null;
+    }
+    const origin = toScenePoint(space, at.x, at.y);
+    image.set({
+      left: origin.x,
+      top: origin.y,
+      originX: 'left',
+      originY: 'top',
+      scaleX: toSceneLength(space, w) / iw,
+      scaleY: toSceneLength(space, h) / ih,
+      opacity: opts.opacity === undefined ? 1 : Math.max(0, Math.min(1, opts.opacity)),
+    });
+    return this.placeObject(image, 'Add image');
+  }
+
+  /**
    * Add text at a place in the picture: its top-left corner at (`x`, `y`),
    * wrapping at `width` when given (else at the picture's right edge). Font size
    * is in output pixels. Returns the new layer's id, or null with no picture.
